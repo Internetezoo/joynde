@@ -1,4 +1,4 @@
 flask
-cloudscraper
-gunicorn
 playwright
+nest_asyncio
+requests
