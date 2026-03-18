@@ -1,40 +1,49 @@
+import asyncio
 from flask import Flask, request, jsonify
-import cloudscraper
+from playwright.async_api import async_playwright
 import os
 
 app = Flask(__name__)
 
-# JAVÍTÁS: Definiálunk egy böngészőt, hogy hitelesebb legyen a lekérés
-scraper = cloudscraper.create_scraper(
-    browser={
-        'browser': 'chrome',
-        'platform': 'windows',
-        'desktop': True
-    }
-)
-
-# ÚJ: Egy sima üdvözlő üzenet a főoldalra (teszteléshez)
-@app.route('/')
-def index():
-    return "A Joyn Scraper API fut! Használd a /scrape?url=... végpontot."
-
-@app.route('/scrape', methods=['GET'])
-def scrape():
-    target_url = request.args.get('url', 'https://www.joyn.de')
+async def scrape_network(target_url):
+    network_log = []
     
-    try:
-        # A timeoutot érdemes 20-ra emelni, mert a Joyn néha lassú
-        response = scraper.get(target_url, timeout=20)
-        
-        return jsonify({
-            "status": response.status_code,
-            "url": target_url,
-            "content": response.text[:10000] # Emeltem kicsit a limiten
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    async with async_playwright() as p:
+        # A Renderen lévő Dockerben így kell indítani a böngészőt
+        browser = await p.chromium.launch(args=['--no-sandbox', '--disable-setuid-sandbox'])
+        page = await browser.new_page()
 
-if __name__ == '__main__':
-    # Ez a rész tökéletes a Renderhez
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+        # Minden hálózati kérést elkapunk
+        def handle_request(request):
+            url = request.url
+            # Csak a fontos dolgokat naplózzuk, hogy ne legyen túl nagy a válasz
+            if any(x in url.lower() for x in ["m3u8", "mpd", "iocproactor", "playback", "license"]):
+                network_log.append({"type": request.resource_type, "url": url})
+
+        page.on("request", handle_request)
+
+        try:
+            # Oldal betöltése a Render német IP-jéről
+            await page.goto(target_url, wait_until="networkidle", timeout=60000)
+            # Várunk, hogy a lejátszó elinduljon és generálja a linkeket
+            await asyncio.sleep(10) 
+            
+            html_content = await page.content()
+            await browser.close()
+            return {"status": "success", "hits": network_log, "html_preview": html_content[:500]}
+        except Exception as e:
+            await browser.close()
+            return {"status": "error", "message": str(e)}
+
+@app.route('/scrape')
+def scrape():
+    url = request.args.get('url')
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+    
+    # Meghívjuk az aszinkron figyelőt
+    result = asyncio.run(scrape_network(url))
+    return jsonify(result)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
